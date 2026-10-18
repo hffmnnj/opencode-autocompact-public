@@ -25,6 +25,8 @@ export interface IdleCompactor {
 
 /** One idle stretch: from a settled run until the next user prompt or execution. */
 interface Stretch {
+  /** Set only by activity this plugin watched happen. Sessions idle before load stay untouched until they run again. */
+  observed: boolean;
   busy: boolean;
   /** At most one automatic compaction per stretch, so our own compaction cannot re-arm the next one. */
   compacted: boolean;
@@ -40,7 +42,7 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
   const stretchFor = (sessionID: string): Stretch => {
     const existing = stretches.get(sessionID);
     if (existing) return existing;
-    const created: Stretch = { busy: false, compacted: false, generation: 0 };
+    const created: Stretch = { observed: false, busy: false, compacted: false, generation: 0 };
     stretches.set(sessionID, created);
     return created;
   };
@@ -91,21 +93,23 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
   return {
     executionStarted(sessionID) {
       const stretch = stretchFor(sessionID);
+      stretch.observed = true;
       stretch.busy = true;
       disarm(stretch);
     },
     executionSettled(sessionID) {
       const stretch = stretchFor(sessionID);
       stretch.busy = false;
-      if (!stretch.compacted && !disposed) arm(sessionID, stretch);
+      if (stretch.observed && !stretch.compacted && !disposed) arm(sessionID, stretch);
     },
     warmingPinged(sessionID) {
       const stretch = stretchFor(sessionID);
-      if (stretch.busy || stretch.compacted || disposed) return;
+      if (!stretch.observed || stretch.busy || stretch.compacted || disposed) return;
       arm(sessionID, stretch);
     },
     userPrompted(sessionID) {
       const stretch = stretchFor(sessionID);
+      stretch.observed = true;
       stretch.compacted = false;
       disarm(stretch);
     },

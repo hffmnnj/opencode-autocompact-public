@@ -53,23 +53,20 @@ const fixture = Plugin.define({ id: "autocompact.fixture", async setup(ctx) {
   }));
 } });
 
-const host = await OpenCode.create({
-  app: { name: "autocompact-tests", version: "0.1.0" }, database: { path: join(root, "host.sqlite") },
+// Same database across both phases, so the "old" session really exists when the plugin loads.
+const databasePath = join(root, "host.sqlite");
+const createHost = (withPlugin: boolean) => OpenCode.create({
+  app: { name: "autocompact-tests", version: "0.1.0" }, database: { path: databasePath },
   config: { directory: join(root, "config"), project: false, content: JSON.stringify({
     update: "disable", model: "autocompacttest/fixture",
     // Keep-alives must land inside the idle window and stop before the idle timer can fire.
     warming: { interval: "1 second", duration: "4 seconds" },
-    plugins: ["*", "-opencode.provider.*", { package: pluginDirectory, options: { idleSeconds: IDLE_SECONDS, cacheTtlSeconds: CACHE_TTL_SECONDS } }],
+    plugins: ["*", "-opencode.provider.*", ...(withPlugin ? [{ package: pluginDirectory, options: { idleSeconds: IDLE_SECONDS, cacheTtlSeconds: CACHE_TTL_SECONDS } }] : [])],
   }) },
   models: { fetch: false, snapshot: false }, fs: { filewatcher: false, fff: false }, plugins: [fixture],
 });
 
 const observed: Array<{ type: string; created: number; data?: { sessionID?: string; reason?: string } }> = [];
-const eventsAbort = new AbortController();
-const observing = (async () => {
-  for await (const event of host.event.subscribe({ signal: eventsAbort.signal })) observed.push(event as typeof observed[number]);
-})().catch(() => undefined);
-
 async function waitFor<T>(description: string, read: () => T | undefined, timeoutMs: number): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -79,21 +76,46 @@ async function waitFor<T>(description: string, read: () => T | undefined, timeou
     await Bun.sleep(25);
   }
 }
-
+/** Each host needs its own subscription: runOnce waits on events from whichever host it drives. */
+function observe(host: Awaited<ReturnType<typeof createHost>>) {
+  const abort = new AbortController();
+  const done = (async () => {
+    for await (const event of host.event.subscribe({ signal: abort.signal })) observed.push(event as typeof observed[number]);
+  })().catch(() => undefined);
+  return async () => {
+    abort.abort();
+    await done;
+  };
+}
 const sessionEvents = (sessionID: string, type: string) => observed.filter(event => event.type === type && event.data?.sessionID === sessionID);
 const idleCompactions = (sessionID: string) => sessionEvents(sessionID, "session.compaction.ended");
+const runOnce = async (host: Awaited<ReturnType<typeof createHost>>, sessionID: string, text: string) => {
+  await host.session.prompt({ sessionID, text });
+  await host.session.wait({ sessionID }, { signal: AbortSignal.timeout(15_000) });
+  return waitFor("settled execution", () => sessionEvents(sessionID, "session.execution.succeeded").at(-1), 5_000);
+};
 
 let exitCode = 0;
+let host: Awaited<ReturnType<typeof createHost>> | undefined;
+let stopObserving: (() => Promise<void>) | undefined;
 try {
+  // Phase 1: a chat that runs before the plugin exists, like a session carried over from before a reload.
+  const preload = await createHost(false);
+  const stopPreloadObserving = observe(preload);
+  const oldSession = await preload.session.create({ location: { directory }, agent: "build", model: { providerID: "autocompacttest", id: "fixture" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+  await runOnce(preload, oldSession.id, "written before the plugin loaded");
+  await stopPreloadObserving();
+  await preload.close();
+
+  // Phase 2: plugin loads; the old chat must stay untouched through a full idle window plus TTL.
+  host = await createHost(true);
+  stopObserving = observe(host);
+  await Bun.sleep((CACHE_TTL_SECONDS + IDLE_SECONDS) * 1000);
+  assert.equal(idleCompactions(oldSession.id).length, 0, "A chat idle before the plugin loaded must never be compacted");
+  assert.equal(providerRequests.filter(request => request.keepAlive).length, 0, "No keep-alive may be sent for the untouched old chat");
+
   const session = await host.session.create({ location: { directory }, agent: "build", model: { providerID: "autocompacttest", id: "fixture" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
-
-  const runOnce = async (text: string) => {
-    await host.session.prompt({ sessionID: session.id, text });
-    await host.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(15_000) });
-    return waitFor("settled execution", () => sessionEvents(session.id, "session.execution.succeeded").at(-1), 5_000);
-  };
-
-  const settled = await runOnce("first prompt");
+  const settled = await runOnce(host, session.id, "first prompt");
   assert.equal(idleCompactions(session.id).length, 0, "No compaction may run before the idle window");
 
   const firstCompaction = await waitFor("automatic idle compaction", () => idleCompactions(session.id).at(0), (CACHE_TTL_SECONDS + 5) * 1000);
@@ -107,9 +129,10 @@ try {
 
   await Bun.sleep((CACHE_TTL_SECONDS + 1) * 1000);
   assert.equal(idleCompactions(session.id).length, 1, "Exactly one automatic compaction per idle stretch");
+  assert.equal(idleCompactions(oldSession.id).length, 0, "The old chat stays untouched after the new chat compacts");
 
   const secondRunStarted = providerRequests.length;
-  await runOnce("second prompt after idle compaction");
+  await runOnce(host, session.id, "second prompt after idle compaction");
   assert(providerRequests.length > secondRunStarted, "The user prompt must reach the provider");
   await waitFor("second automatic idle compaction after a new prompt", () => (idleCompactions(session.id).length >= 2 ? true : undefined), (CACHE_TTL_SECONDS + 5) * 1000);
   await Bun.sleep((CACHE_TTL_SECONDS + 1) * 1000);
@@ -119,6 +142,7 @@ try {
     nativeEnforcement: "verified",
     idleSeconds: IDLE_SECONDS,
     cacheTtlSeconds: CACHE_TTL_SECONDS,
+    oldChatCompactions: idleCompactions(oldSession.id).length,
     keepAlivesBeforeCompaction: keepAlivesBeforeCompaction.length,
     idleGapFromFinalKeepAliveMs: idleGapMs,
     automaticCompactions: idleCompactions(session.id).length,
@@ -126,18 +150,17 @@ try {
   }));
 } catch (error) {
   exitCode = 1;
-  const catalog = await host.plugin.list({ location: { directory } }).catch(() => undefined);
+  const catalog = await host?.plugin.list({ location: { directory } }).catch(() => undefined);
   console.error(JSON.stringify({
     error: error instanceof Error ? error.message : "unknown failure",
-    plugins: catalog?.data.map(plugin => ({ id: plugin.id, status: plugin.state.status })),
+    plugins: catalog?.data.filter(plugin => plugin.id === "opencode-autocompact").map(plugin => ({ id: plugin.id, status: plugin.state.status })),
     eventTypes: [...new Set(observed.map(event => event.type))],
     compactionFailures: observed.filter(event => event.type === "session.compaction.failed"),
     providerRequests: providerRequests.length,
   }));
 } finally {
-  eventsAbort.abort();
-  await observing;
-  await host.close();
+  await stopObserving?.();
+  await host?.close();
   server.stop(true);
 }
 process.exit(exitCode);
