@@ -1,0 +1,23 @@
+{
+  "name": "opencode-autocompact",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.25"
+  },
+  "devDependencies": {
+    "@opencode/sdk": "2.0.25",
+    "@types/bun": "1.3.5",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/unit",
+    "check": "bun run typecheck && bun run test",
+    "test:host": "bun tests/host/run.ts"
+  }
+}
