@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createIdleCompactor, type CompactorDeps, type CompactorOptions } from "../../src/compactor";
+import type { Trace } from "../../src/trace";
 
 const SECOND = 1_000;
 const OPTIONS: CompactorOptions = { idleMs: 290 * SECOND, cacheTtlMs: 300 * SECOND, includeSubagents: false };
@@ -13,7 +14,7 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
   const scheduled: ScheduledRun[] = [];
   const compacted: string[] = [];
   const reports: string[] = [];
-  const announced: Array<{ sessionID: string; idleMs: number }> = [];
+  const traces: Trace[] = [];
 
   const deps: CompactorDeps = {
     now: () => clock,
@@ -31,8 +32,8 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
     report: message => {
       reports.push(message);
     },
-    announce: (sessionID, idleMs) => {
-      announced.push({ sessionID, idleMs });
+    trace: trace => {
+      traces.push(trace);
     },
     ...overrides,
   };
@@ -60,7 +61,8 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
     compactor,
     compacted,
     reports,
-    announced,
+    traces,
+    announced: () => traces.filter(trace => trace.event === "compacting"),
     advanceTo: async (ms: number) => {
       await runDueTimers(ms);
       clock = ms;
@@ -343,7 +345,7 @@ describe("sessions owned by another plugin instance", () => {
 
     await h.advanceTo(10_000 * SECOND);
     expect(h.compacted).toEqual([]);
-    expect(h.announced).toEqual([]);
+    expect(h.traces).toEqual([]);
   });
 
 });
@@ -379,12 +381,134 @@ describe("accountability", () => {
     h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(290 * SECOND);
-    expect(h.announced).toEqual([{ sessionID: SESSION, idleMs: 290 * SECOND }]);
+    expect(h.announced()).toEqual([{ event: "compacting", sessionID: SESSION, idleMs: 290 * SECOND }]);
 
     const skipped = harness({ isEligible: async () => false });
     skipped.compactor.modelCalled(SESSION);
     skipped.compactor.executionSettled(SESSION);
     await skipped.advanceTo(290 * SECOND);
-    expect(skipped.announced).toEqual([]);
+    expect(skipped.announced()).toEqual([]);
+  });
+});
+
+describe("decision trace", () => {
+  const events = (h: ReturnType<typeof harness>) => h.traces.map(trace => trace.event);
+
+  test("tells the whole story of a warmed session: owned, armed, re-armed by keep-alives, compacting, done", async () => {
+    const h = harness();
+    h.compactor.userPrompted(SESSION);
+    h.compactor.modelCalled(SESSION);
+    h.compactor.executionSettled(SESSION);
+    await h.advanceTo(240 * SECOND);
+    h.compactor.warmingPinged(SESSION);
+    await h.advanceTo(240 * SECOND + 290 * SECOND);
+
+    expect(h.traces).toEqual([
+      { event: "owned", sessionID: SESSION, via: "prompt" },
+      { event: "armed", sessionID: SESSION, via: "settled", fireInMs: 290 * SECOND },
+      { event: "armed", sessionID: SESSION, via: "keepalive", fireInMs: 290 * SECOND },
+      { event: "compacting", sessionID: SESSION, idleMs: 290 * SECOND },
+      { event: "compact-result", sessionID: SESSION, ok: true },
+    ]);
+  });
+
+  test("explains why a countdown was cancelled", async () => {
+    const h = harness();
+    h.compactor.modelCalled(SESSION);
+    h.compactor.executionSettled(SESSION);
+    h.compactor.executionStarted(SESSION);
+    h.compactor.executionSettled(SESSION);
+    h.compactor.userPrompted(SESSION);
+    h.compactor.executionSettled(SESSION);
+    h.compactor.compactionRequested(SESSION);
+
+    expect(h.traces.filter(trace => trace.event === "disarmed")).toEqual([
+      { event: "disarmed", sessionID: SESSION, why: "execution-started" },
+      { event: "disarmed", sessionID: SESSION, why: "prompt" },
+      { event: "disarmed", sessionID: SESSION, why: "compaction-seen" },
+    ]);
+  });
+
+  test("records why a due compaction did not happen: cache expired, ineligible, activity during lookup", async () => {
+    const expired = harness();
+    expired.compactor.modelCalled(SESSION);
+    expired.compactor.executionSettled(SESSION);
+    await expired.wakeAt(310 * SECOND);
+    expect(expired.traces.at(-1)).toEqual({ event: "skipped", sessionID: SESSION, why: "cache-expired", idleMs: 310 * SECOND });
+
+    const ineligible = harness({ isEligible: async () => false });
+    ineligible.compactor.modelCalled(SESSION);
+    ineligible.compactor.executionSettled(SESSION);
+    await ineligible.advanceTo(290 * SECOND);
+    expect(ineligible.traces.at(-1)).toEqual({ event: "skipped", sessionID: SESSION, why: "ineligible", idleMs: 290 * SECOND });
+
+    let release: (eligible: boolean) => void = () => undefined;
+    const pending = new Promise<boolean>(resolve => {
+      release = resolve;
+    });
+    const racing = harness({ isEligible: () => pending });
+    racing.compactor.modelCalled(SESSION);
+    racing.compactor.executionSettled(SESSION);
+    await racing.advanceTo(290 * SECOND);
+    racing.compactor.userPrompted(SESSION);
+    release(true);
+    await racing.advanceTo(290 * SECOND);
+    expect(racing.traces.at(-1)).toEqual({ event: "skipped", sessionID: SESSION, why: "activity-during-lookup", idleMs: 290 * SECOND });
+  });
+
+  test("a failure is logged by class name only, never the native text", async () => {
+    const failing = harness({
+      compact: async () => {
+        throw new TypeError("transcript: secret user text");
+      },
+    });
+    failing.compactor.modelCalled(SESSION);
+    failing.compactor.executionSettled(SESSION);
+    await failing.advanceTo(290 * SECOND);
+    expect(failing.traces.at(-1)).toEqual({ event: "compact-result", sessionID: SESSION, ok: false, errorName: "TypeError" });
+    expect(JSON.stringify(failing.traces)).not.toContain("secret user text");
+  });
+
+  test("tells our own compaction apart from a user's, even when the host reports it after compact() returned", async () => {
+    const own = harness();
+    own.compactor.modelCalled(SESSION);
+    own.compactor.executionSettled(SESSION);
+    await own.advanceTo(290 * SECOND);
+    own.compactor.compactionRequested(SESSION);
+    expect(own.traces.filter(trace => trace.event === "compaction-seen")).toEqual([{ event: "compaction-seen", sessionID: SESSION, by: "plugin" }]);
+
+    // A later user compaction in the same session is not ours.
+    own.compactor.compactionRequested(SESSION);
+    expect(own.traces.filter(trace => trace.event === "compaction-seen").at(-1)).toEqual({ event: "compaction-seen", sessionID: SESSION, by: "other" });
+
+    const manual = harness();
+    manual.compactor.modelCalled(SESSION);
+    manual.compactor.compactionRequested(SESSION);
+    expect(manual.traces.filter(trace => trace.event === "compaction-seen")).toEqual([{ event: "compaction-seen", sessionID: SESSION, by: "other" }]);
+  });
+
+  test("keep-alives and settles that change nothing are logged with their reason", async () => {
+    const h = harness();
+    h.compactor.modelCalled(SESSION);
+    h.compactor.warmingPinged(SESSION);
+    h.compactor.executionSettled(SESSION);
+    await h.advanceTo(290 * SECOND);
+    h.compactor.warmingPinged(SESSION);
+    h.compactor.executionSettled(SESSION);
+
+    expect(h.traces.filter(trace => trace.event === "keepalive-ignored" || trace.event === "settle-ignored")).toEqual([
+      { event: "keepalive-ignored", sessionID: SESSION, why: "running" },
+      { event: "keepalive-ignored", sessionID: SESSION, why: "already-compacted" },
+      { event: "settle-ignored", sessionID: SESSION, why: "already-compacted" },
+    ]);
+  });
+
+  test("a session this instance never owned leaves no trace at all, however many events it hears", () => {
+    const h = harness();
+    for (let run = 0; run < 3; run++) {
+      h.compactor.executionStarted(SESSION);
+      h.compactor.executionSettled(SESSION);
+    }
+    expect(events(h)).toEqual([]);
   });
 });

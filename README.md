@@ -13,7 +13,8 @@ An OpenCode V2 plugin that compacts a primary session once it has been idle for 
 - **Only sessions this plugin instance owns and has seen active.** The host loads one plugin instance per location (project directory). Session *events* reach every instance, but *hooks* reach only the instance whose location holds the session, and keep-alives are visible only through a hook. So a session becomes eligible only through a hook in its own instance: a user prompt or a model call (`context`). Events alone never create state, because an instance that cannot hear the keep-alives would fire at the settled run plus 290 seconds while warming is still running. Sessions that were idle when the plugin loaded are never compacted, and keep-alives alone do not make them eligible. Old chats stay untouched until they run again.
 - **A compaction by anyone ends the stretch.** A manual `/compact` during the countdown cancels it, and no automatic one follows until the next user prompt.
 - **Location check at fire time.** Before compacting, the instance re-reads the session and refuses unless the session's directory is its own. This is a second layer in case hooks ever stop being location-scoped.
-- **Every automatic compaction is announced** in the server log as `opencode-autocompact: compacting <sessionID> after <N>s idle in <directory>`. The host records these as `reason: "manual"`, so this line is the only way to tell them apart.
+- **Every decision is logged.** The host records the plugin's compactions as `reason: "manual"`, so the decision log is the only way to tell them from a user's. See [Decision log](#decision-log).
+- **Fail-open.** Every hook and the event loop are wrapped. A bug in this plugin is reported once per error class and swallowed; it can never fail the session it watches.
 - **Primary sessions only** by default. Child sessions (subagents) are skipped unless `includeSubagents` is set.
 
 ## Install
@@ -54,14 +55,38 @@ Claude Code shipped idle compaction in 2.1.286. Per GitHub issue anthropics/clau
 - The native host records these compactions as `reason: "manual"`, because they go through the API.
 - The timer uses wall-clock time. A suspended machine that wakes inside the TTL window still compacts warm. A wake after the TTL is skipped.
 
+## Decision log
+
+One JSON object per line, appended to `$XDG_STATE_HOME/opencode-autocompact/decisions.jsonl` (default `~/.local/state/opencode-autocompact/decisions.jsonl`). Set `logFile` to an absolute path to move it, or `false` to turn it off. It rotates to `decisions.jsonl.1` past 5 MB and never deletes. Lines hold session IDs, timings and event names only, never conversation text or native error messages.
+
+Every line has `at`, `instance` (the location whose plugin instance decided) and `pid`, plus:
+
+| `event` | Meaning |
+| --- | --- |
+| `loaded` / `disposed` | Instance start and stop, with the effective options. |
+| `owned` | A prompt or model call reached this instance's hooks (`via`). Only then is a session a candidate. |
+| `armed` | A countdown started (`via`: `settled` run or `keepalive`), with `fireInMs`. |
+| `disarmed` | A pending countdown was cancelled, and `why`. |
+| `keepalive-ignored`, `settle-ignored` | A signal changed nothing, and `why` (`running`, `already-compacted`). |
+| `skipped` | The countdown ended without compacting: `cache-expired`, `ineligible`, `activity-during-lookup`. |
+| `compacting` / `compact-result` | The request was sent, and whether it was accepted (`ok`, `errorName`). |
+| `compaction-seen` | The host reported a compaction: `by: "plugin"` or `"other"` (a user's). |
+
+Answering "why did it compact at 14:17?": `grep ses_xxx decisions.jsonl` shows the owning instance, each `armed` with its `via`, and whether a keep-alive ever re-armed it. The same `compacting` decision is also written to the server log as a `console.warn` line.
+
 ## Incident: compaction while warming (fixed)
 
 The first live version compacted a session at exactly the settled run plus 290 seconds, although native warming had pinged it 54 seconds earlier. Cause, reproduced with a probe on a real two-location host: the plugin loads once per location, events reach all instances, hooks reach only the owner. The other instances armed a countdown from the events, never heard a keep-alive, and fired. Fix: ownership comes only from hooks, as described above. The host test now runs two locations and fails on the old code with `compaction fired before the final keep-alive plus the idle window: 16ms`.
 
+## Incident: broken hot reload (process)
+
+The host reloads this plugin from disk when its files change. A half-edited working tree was once live, and a hook threw `deps.trace is not a function`, which made the host log `Failed to drain Session` for several unrelated sessions. Two guards: develop on a branch and point the host at a separate clean checkout (a git worktree of `main`), and the fail-open wrapper above.
+
 ## Verification
 
 - `bun run check`: typecheck, then the deterministic unit tests on an injected clock. They cover exactly 290s, the cache-TTL cutoff, a late wake, a prompt during the window, a pending eligibility lookup, once-per-stretch, keep-alive restarts, events for sessions the instance does not own, manual compactions, and the announcement.
-- `bun run test:host`: an isolated real OpenCode V2 host (2.0.25), restarted across a plugin load, with two locations, a loopback scripted provider and native warming on (`interval 1s`, `duration 4s`; plugin `idleSeconds: 2`, `cacheTtlSeconds: 6`). It checks:
+- Decision-log unit tests cover the story of a warmed session, every cancel reason, every skip reason, own versus user compaction (including the host reporting it after `compact()` returned), failures logged by class name only, line format, concurrent appenders, an unwritable path, and rotation.
+- `bun run test:host`: an isolated real OpenCode V2 host (2.0.25), restarted across a plugin load, with two locations, and the decision log checked for who decided, the keep-alive re-arm, the attribution and the result, a loopback scripted provider and native warming on (`interval 1s`, `duration 4s`; plugin `idleSeconds: 2`, `cacheTtlSeconds: 6`). It checks:
   - an old chat that finished before the plugin loaded gets no compaction, no keep-alive and no announcement;
   - in each location, the compaction comes a full idle window after that session's own last keep-alive, once per stretch, with no duplicate from the other instance;
   - a new prompt starts exactly one new stretch;

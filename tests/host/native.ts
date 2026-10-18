@@ -60,13 +60,14 @@ const fixture = Plugin.define({ id: "autocompact.fixture", async setup(ctx) {
 
 // Same database across both phases, so the "old" session really exists when the plugin loads.
 const databasePath = join(root, "host.sqlite");
+const decisionLogPath = join(root, "decisions.jsonl");
 const createHost = (withPlugin: boolean) => OpenCode.create({
   app: { name: "autocompact-tests", version: "0.1.0" }, database: { path: databasePath },
   config: { directory: join(root, "config"), project: false, content: JSON.stringify({
     update: "disable", model: "autocompacttest/fixture",
     // Keep-alives must land inside the idle window and stop before the idle timer can fire.
     warming: { interval: "1 second", duration: "4 seconds" },
-    plugins: ["*", "-opencode.provider.*", ...(withPlugin ? [{ package: pluginDirectory, options: { idleSeconds: IDLE_SECONDS, cacheTtlSeconds: CACHE_TTL_SECONDS } }] : [])],
+    plugins: ["*", "-opencode.provider.*", ...(withPlugin ? [{ package: pluginDirectory, options: { idleSeconds: IDLE_SECONDS, cacheTtlSeconds: CACHE_TTL_SECONDS, logFile: decisionLogPath } }] : [])],
   }) },
   models: { fetch: false, snapshot: false }, fs: { filewatcher: false, fff: false }, plugins: [fixture],
 });
@@ -175,10 +176,31 @@ try {
   assert.equal(idleCompactions(session.id).length, 2, "A new user prompt starts exactly one new idle stretch");
   assert.equal(idleCompactions(other.id).length, 1, "The untouched second location stays at one compaction");
 
+  // The decision log must explain every compaction: who decided, in which location, and after which keep-alives.
+  type Decision = { event: string; sessionID?: string; instance: string; via?: string; by?: string; ok?: boolean };
+  const decisions = (await Bun.file(decisionLogPath).text()).trim().split("\n").map(line => JSON.parse(line) as Decision);
+  const forSession = (sessionID: string) => decisions.filter(decision => decision.sessionID === sessionID);
+  assert.equal(forSession(oldSession.id).length, 0, "The old chat must leave no trace: it was never owned");
+  for (const [label, target, where] of [["main", session.id, directory], ["other", other.id, otherDirectory]] as const) {
+    const entries = forSession(target);
+    const compacting = entries.filter(decision => decision.event === "compacting");
+    assert(compacting.length >= 1, `${label}: the log must record the compaction decision`);
+    assert(compacting.every(decision => decision.instance === where), `${label}: only the instance that owns the location may decide to compact`);
+    assert(entries.some(decision => decision.event === "armed" && decision.via === "keepalive"), `${label}: the log must show a keep-alive re-arming the countdown`);
+    assert(entries.some(decision => decision.event === "compaction-seen" && decision.by === "plugin"), `${label}: the compaction must be attributed to the plugin`);
+    assert(entries.some(decision => decision.event === "compact-result" && decision.ok === true), `${label}: the result must be recorded`);
+    assert(entries.every(decision => decision.instance === where), `${label}: no other instance may log anything about this session`);
+  }
+  const manualEntries = forSession(manual.id);
+  assert(manualEntries.some(decision => decision.event === "compaction-seen" && decision.by === "other"), "A user's compaction must be attributed to someone else");
+  assert(!manualEntries.some(decision => decision.event === "compacting"), "No compaction decision for the manually compacted session");
+  assert(decisions.some(decision => decision.event === "loaded"), "Each instance logs its configuration when it loads");
+
   console.log(JSON.stringify({
     nativeEnforcement: "verified",
     idleSeconds: IDLE_SECONDS,
     cacheTtlSeconds: CACHE_TTL_SECONDS,
+    decisionLogLines: decisions.length,
     oldChatCompactions: idleCompactions(oldSession.id).length,
     keepAlivesBeforeCompaction: { main: main.keepAlives, other: second.keepAlives },
     idleGapFromFinalKeepAliveMs: { main: main.gapMs, other: second.gapMs },

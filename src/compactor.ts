@@ -1,3 +1,5 @@
+import type { Trace } from "./trace";
+
 export interface CompactorOptions {
   readonly idleMs: number;
   readonly cacheTtlMs: number;
@@ -12,8 +14,8 @@ export interface CompactorDeps {
   readonly compact: (sessionID: string) => Promise<void>;
   /** Failures only; never include conversation content. */
   readonly report: (message: string) => void;
-  /** Every automatic compaction is announced, so an unexpected one can be traced to this plugin. */
-  readonly announce: (sessionID: string, idleMs: number) => void;
+  /** Every decision is traced, so an unexpected compaction can be explained from the log. */
+  readonly trace: (trace: Trace) => void;
 }
 
 /**
@@ -41,6 +43,11 @@ interface Stretch {
   busy: boolean;
   /** At most one automatic compaction per stretch, so our own compaction cannot re-arm the next one. */
   compacted: boolean;
+  /**
+   * Set when this plugin asked for a compaction, cleared when the host's `compaction` hook reports it. That hook runs
+   * after `compact()` has already returned (the request is queued), so the flag cannot be tied to the call's lifetime.
+   */
+  requesting: boolean;
   /** Bumped on every transition; a callback scheduled or started under an older value is stale. */
   generation: number;
   cancel?: () => void;
@@ -50,24 +57,30 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
   const stretches = new Map<string, Stretch>();
   let disposed = false;
 
-  const stretchFor = (sessionID: string): Stretch => {
+  /** Creates state, which marks this instance as the owner. Only owner-scoped hooks may call this. */
+  const own = (sessionID: string, via: "prompt" | "context"): Stretch => {
     const existing = stretches.get(sessionID);
     if (existing) return existing;
-    const created: Stretch = { busy: false, compacted: false, generation: 0 };
+    const created: Stretch = { busy: false, compacted: false, requesting: false, generation: 0 };
     stretches.set(sessionID, created);
+    deps.trace({ event: "owned", sessionID, via });
     return created;
   };
 
-  const disarm = (stretch: Stretch): void => {
+  const disarm = (sessionID: string, stretch: Stretch, why: Extract<Trace, { event: "disarmed" }>["why"]): void => {
+    // Only a countdown that was actually pending is worth a log line.
+    if (stretch.cancel) deps.trace({ event: "disarmed", sessionID, why });
     stretch.generation++;
     stretch.cancel?.();
     stretch.cancel = undefined;
   };
 
-  const arm = (sessionID: string, stretch: Stretch): void => {
-    disarm(stretch);
+  const arm = (sessionID: string, stretch: Stretch, via: "settled" | "keepalive"): void => {
+    stretch.generation++;
+    stretch.cancel?.();
     const generation = stretch.generation;
     const armedAt = deps.now();
+    deps.trace({ event: "armed", sessionID, via, fireInMs: options.idleMs });
 
     const tick = (): void => {
       stretch.cancel = undefined;
@@ -80,7 +93,10 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
       }
       // A late wake (for example after laptop sleep) means the cache has already expired. Compacting cold
       // re-reads the full history and then pays for the summary as well, which costs more than it saves.
-      if (elapsed >= options.cacheTtlMs) return;
+      if (elapsed >= options.cacheTtlMs) {
+        deps.trace({ event: "skipped", sessionID, why: "cache-expired", idleMs: elapsed });
+        return;
+      }
 
       stretch.compacted = true;
       void compactIdle(sessionID, generation, stretch, elapsed);
@@ -91,13 +107,23 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
 
   const compactIdle = async (sessionID: string, generation: number, stretch: Stretch, idleMs: number): Promise<void> => {
     try {
-      if (!(await deps.isEligible(sessionID))) return;
+      if (!(await deps.isEligible(sessionID))) {
+        deps.trace({ event: "skipped", sessionID, why: "ineligible", idleMs });
+        return;
+      }
       // Re-check after the awaited lookup: a prompt or new execution may have arrived in the meantime.
-      if (disposed || stretch.generation !== generation || stretch.busy) return;
-      deps.announce(sessionID, idleMs);
+      if (disposed || stretch.generation !== generation || stretch.busy) {
+        deps.trace({ event: "skipped", sessionID, why: "activity-during-lookup", idleMs });
+        return;
+      }
+      deps.trace({ event: "compacting", sessionID, idleMs });
+      stretch.requesting = true;
       await deps.compact(sessionID);
-    } catch {
-      // Never forward the native error: it can contain conversation content.
+      deps.trace({ event: "compact-result", sessionID, ok: true });
+    } catch (error) {
+      // Never forward the native error text: it can contain conversation content. The class name is safe.
+      stretch.requesting = false;
+      deps.trace({ event: "compact-result", sessionID, ok: false, errorName: error instanceof Error ? error.name : "unknown" });
       deps.report("idle compaction request failed; the session was left unchanged");
     }
   };
@@ -107,47 +133,63 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
 
   return {
     modelCalled(sessionID) {
-      const stretch = stretchFor(sessionID);
+      const stretch = own(sessionID, "context");
       stretch.busy = true;
-      disarm(stretch);
+      disarm(sessionID, stretch, "model-call");
     },
     compactionRequested(sessionID) {
       const stretch = known(sessionID);
       if (!stretch) return;
+      deps.trace({ event: "compaction-seen", sessionID, by: stretch.requesting ? "plugin" : "other" });
+      stretch.requesting = false;
       stretch.compacted = true;
-      disarm(stretch);
+      disarm(sessionID, stretch, "compaction-seen");
     },
     executionStarted(sessionID) {
       const stretch = known(sessionID);
       if (!stretch) return;
       stretch.busy = true;
-      disarm(stretch);
+      disarm(sessionID, stretch, "execution-started");
     },
     executionSettled(sessionID) {
       const stretch = known(sessionID);
       if (!stretch) return;
       stretch.busy = false;
-      if (!stretch.compacted && !disposed) arm(sessionID, stretch);
+      if (disposed) return;
+      if (stretch.compacted) {
+        deps.trace({ event: "settle-ignored", sessionID, why: "already-compacted" });
+        return;
+      }
+      arm(sessionID, stretch, "settled");
     },
     warmingPinged(sessionID) {
       const stretch = known(sessionID);
-      if (!stretch || stretch.busy || stretch.compacted || disposed) return;
-      arm(sessionID, stretch);
+      if (!stretch || disposed) return;
+      if (stretch.busy || stretch.compacted) {
+        deps.trace({ event: "keepalive-ignored", sessionID, why: stretch.busy ? "running" : "already-compacted" });
+        return;
+      }
+      arm(sessionID, stretch, "keepalive");
     },
     userPrompted(sessionID) {
-      const stretch = stretchFor(sessionID);
+      const stretch = own(sessionID, "prompt");
       stretch.compacted = false;
-      disarm(stretch);
+      stretch.requesting = false;
+      disarm(sessionID, stretch, "prompt");
     },
     forget(sessionID) {
       const stretch = stretches.get(sessionID);
       if (!stretch) return;
-      disarm(stretch);
+      disarm(sessionID, stretch, "forgotten");
       stretches.delete(sessionID);
     },
     dispose() {
       disposed = true;
-      for (const stretch of stretches.values()) disarm(stretch);
+      for (const stretch of stretches.values()) {
+        stretch.generation++;
+        stretch.cancel?.();
+        stretch.cancel = undefined;
+      }
       stretches.clear();
     },
   };
