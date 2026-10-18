@@ -8,6 +8,7 @@ describe("parseConfig defaults", () => {
       cacheTtlSeconds: 300,
       includeSubagents: false,
       warmingPrompt: DEFAULT_WARMING_PROMPT,
+      logFile: undefined,
     });
   });
 
@@ -20,6 +21,15 @@ describe("parseConfig defaults", () => {
 
   test("takes a customised keep-alive prompt for warming detection", () => {
     expect(parseConfig({ warmingPrompt: "ping" })).toMatchObject({ warmingPrompt: "ping" });
+  });
+});
+
+describe("parseConfig decision log", () => {
+  test("accepts an absolute path or false, and rejects a relative path that would depend on the server's cwd", () => {
+    expect(parseConfig({ logFile: "/var/log/ac.jsonl" }).logFile).toBe("/var/log/ac.jsonl");
+    expect(parseConfig({ logFile: false }).logFile).toBe(false);
+    expect(() => parseConfig({ logFile: "decisions.jsonl" })).toThrow("logFile must be an absolute path or false");
+    expect(() => parseConfig({ logFile: true })).toThrow("logFile must be an absolute path or false");
   });
 });
 

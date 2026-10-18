@@ -1,3 +1,5 @@
+import { isAbsolute } from "node:path";
+
 /** Default idle window: just under the 5-minute prompt-cache lifetime, so compaction is dispatched while the cache is still warm. */
 export const DEFAULT_IDLE_SECONDS = 290;
 /** Anthropic's default prompt-cache lifetime. Set to 3600 for accounts on the 1-hour tier. */
@@ -12,9 +14,11 @@ export interface AutoCompactConfig {
   readonly cacheTtlSeconds: number;
   readonly includeSubagents: boolean;
   readonly warmingPrompt: string;
+  /** Decision log path; `false` disables the file. `undefined` means the default state-directory path. */
+  readonly logFile: string | false | undefined;
 }
 
-const KNOWN_KEYS = new Set(["idleSeconds", "cacheTtlSeconds", "includeSubagents", "warmingPrompt"]);
+const KNOWN_KEYS = new Set(["idleSeconds", "cacheTtlSeconds", "includeSubagents", "warmingPrompt", "logFile"]);
 
 function positiveInteger(value: unknown, name: string, fallback: number): number {
   if (value === undefined) return fallback;
@@ -34,7 +38,10 @@ export function parseConfig(raw: unknown): AutoCompactConfig {
   if (unknown.length > 0) {
     throw new Error(`opencode-autocompact: unknown option(s): ${unknown.join(", ")}`);
   }
-  const { idleSeconds, cacheTtlSeconds, includeSubagents, warmingPrompt } = raw as Record<string, unknown>;
+  const { idleSeconds, cacheTtlSeconds, includeSubagents, warmingPrompt, logFile } = raw as Record<string, unknown>;
+  if (logFile !== undefined && logFile !== false && (typeof logFile !== "string" || !isAbsolute(logFile))) {
+    throw new Error("opencode-autocompact: logFile must be an absolute path or false");
+  }
   if (includeSubagents !== undefined && typeof includeSubagents !== "boolean") {
     throw new Error("opencode-autocompact: includeSubagents must be a boolean");
   }
@@ -46,6 +53,7 @@ export function parseConfig(raw: unknown): AutoCompactConfig {
     cacheTtlSeconds: positiveInteger(cacheTtlSeconds, "cacheTtlSeconds", DEFAULT_CACHE_TTL_SECONDS),
     includeSubagents: includeSubagents ?? false,
     warmingPrompt: warmingPrompt ?? DEFAULT_WARMING_PROMPT,
+    logFile,
   };
   // Compaction must be dispatched before the cache expires; an idle window at or past the TTL can never fire warm.
   if (config.idleSeconds >= config.cacheTtlSeconds) {
