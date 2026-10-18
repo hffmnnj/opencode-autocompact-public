@@ -20,20 +20,31 @@ export default Plugin.define({
           return () => clearTimeout(timer);
         },
         isEligible: async sessionID => {
-          if (config.includeSubagents) return true;
           const info = await ctx.session.get({ sessionID });
-          return info.parentID === undefined;
+          // Hooks are location-scoped today, so only the owning instance has state. This check keeps a second
+          // instance from compacting someone else's session should that ever stop being true.
+          if (info.location.directory !== ctx.location.directory) return false;
+          return config.includeSubagents || info.parentID === undefined;
         },
         // Queue rather than steer: an idle session runs the compaction now, and a racing user message is never injected mid-run.
         compact: async sessionID => {
           await ctx.session.compact({ sessionID, delivery: "queue" });
         },
         report: message => console.warn(`opencode-autocompact: ${message}`),
+        announce: (sessionID, idleMs) =>
+          console.warn(`opencode-autocompact: compacting ${sessionID} after ${Math.round(idleMs / 1000)}s idle in ${ctx.location.directory}`),
       },
     );
 
+    // These hooks reach only the instance that owns the session's location, which is what makes them proof of ownership.
     const promptHook = await ctx.session.hook("prompt", event => {
       compactor.userPrompted(event.sessionID);
+    });
+    const contextHook = await ctx.session.hook("context", event => {
+      compactor.modelCalled(event.sessionID);
+    });
+    const compactionHook = await ctx.session.hook("compaction", event => {
+      compactor.compactionRequested(event.sessionID);
     });
     // Observe only: the keep-alive request is answered normally; this hook never alters it.
     const warmingHook = await ctx.session.hook("generate", event => {
@@ -67,6 +78,8 @@ export default Plugin.define({
       subscription.abort();
       compactor.dispose();
       await promptHook.dispose();
+      await contextHook.dispose();
+      await compactionHook.dispose();
       await warmingHook.dispose();
       await observing;
     };

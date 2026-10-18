@@ -8,22 +8,27 @@ import { OpenCode } from "@opencode/sdk";
 // Runs inside an isolated HOME/XDG tree created by run.ts. Real native host, real plugin loader, scripted provider.
 const root = process.argv[2]!;
 assert(root.startsWith("/tmp/autocompact-host-") && process.env.HOME === join(root, "home"));
+// Two locations: the plugin loads one instance per location, and events reach every instance while hooks do not.
 const directory = join(root, "workspace");
+const otherDirectory = join(root, "workspace-other");
 await mkdir(directory, { recursive: true });
+await mkdir(otherDirectory, { recursive: true });
 
 const IDLE_SECONDS = 2;
 const CACHE_TTL_SECONDS = 6;
 const pluginDirectory = fileURLToPath(new URL("../../", import.meta.url));
 
 type ProviderRequest = { stream?: boolean; messages: Array<{ role: string; content?: unknown }> };
-const providerRequests: Array<{ at: number; keepAlive: boolean }> = [];
+const providerRequests: Array<{ at: number; keepAlive: boolean; tag: string }> = [];
 // The native warming plugin sends its keep-alive prompt as the final message; this is the only trace it leaves.
 const KEEP_ALIVE_MARKER = "keep-alive request";
 let serial = 0;
 const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
   assert.equal(new URL(request.url).pathname, "/v1/chat/completions");
   const body = (await request.json()) as ProviderRequest;
-  providerRequests.push({ at: Date.now(), keepAlive: JSON.stringify(body.messages.at(-1)).includes(KEEP_ALIVE_MARKER) });
+  // Every prompt carries a "[tag:X]" marker; the history it leaves in later requests says which session a request belongs to.
+  const tag = /\[tag:([a-z-]+)\]/.exec(JSON.stringify(body.messages))?.[1] ?? "none";
+  providerRequests.push({ at: Date.now(), keepAlive: JSON.stringify(body.messages.at(-1)).includes(KEEP_ALIVE_MARKER), tag });
   const base = { id: `response_${++serial}`, created: 1, model: "fixture" };
   // Compaction rejects summaries without a native template heading, so every scripted reply carries one.
   const reply = "## Objective\nFixture complete";
@@ -66,6 +71,16 @@ const createHost = (withPlugin: boolean) => OpenCode.create({
   models: { fetch: false, snapshot: false }, fs: { filewatcher: false, fff: false }, plugins: [fixture],
 });
 
+// The plugin runs in this process, so its announcements show every compaction it decided on, including ones the host
+// would turn into no-ops (a second compaction of an already-compacted session leaves no event behind).
+const announcements: string[] = [];
+const forwardWarn = console.warn.bind(console);
+console.warn = (...args: unknown[]) => {
+  announcements.push(args.join(" "));
+  forwardWarn(...args);
+};
+const announcedFor = (sessionID: string) => announcements.filter(line => line.includes(`compacting ${sessionID} `)).length;
+
 const observed: Array<{ type: string; created: number; data?: { sessionID?: string; reason?: string } }> = [];
 async function waitFor<T>(description: string, read: () => T | undefined, timeoutMs: number): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -103,7 +118,7 @@ try {
   const preload = await createHost(false);
   const stopPreloadObserving = observe(preload);
   const oldSession = await preload.session.create({ location: { directory }, agent: "build", model: { providerID: "autocompacttest", id: "fixture" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
-  await runOnce(preload, oldSession.id, "written before the plugin loaded");
+  await runOnce(preload, oldSession.id, "written before the plugin loaded [tag:old]");
   await stopPreloadObserving();
   await preload.close();
 
@@ -114,38 +129,60 @@ try {
   assert.equal(idleCompactions(oldSession.id).length, 0, "A chat idle before the plugin loaded must never be compacted");
   assert.equal(providerRequests.filter(request => request.keepAlive).length, 0, "No keep-alive may be sent for the untouched old chat");
 
-  const session = await host.session.create({ location: { directory }, agent: "build", model: { providerID: "autocompacttest", id: "fixture" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
-  const settled = await runOnce(host, session.id, "first prompt");
-  assert.equal(idleCompactions(session.id).length, 0, "No compaction may run before the idle window");
+  const newSession = (where: string) =>
+    host!.session.create({ location: { directory: where }, agent: "build", model: { providerID: "autocompacttest", id: "fixture" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+  const session = await newSession(directory);
+  const other = await newSession(otherDirectory);
+  // Run back to back so each location's plugin instance also hears the other session's execution events.
+  const settled = await runOnce(host, session.id, "first prompt [tag:main]");
+  const otherSettled = await runOnce(host, other.id, "first prompt [tag:other]");
+  assert.equal(idleCompactions(session.id).length + idleCompactions(other.id).length, 0, "No compaction may run before the idle window");
 
-  const firstCompaction = await waitFor("automatic idle compaction", () => idleCompactions(session.id).at(0), (CACHE_TTL_SECONDS + 5) * 1000);
-  const keepAlivesBeforeCompaction = providerRequests.filter(request => request.keepAlive && request.at <= firstCompaction.created);
-  assert(keepAlivesBeforeCompaction.length >= 2, "Warming must have run before the compaction, or the test proves nothing about it");
-  const lastKeepAliveAt = Math.max(...keepAlivesBeforeCompaction.map(request => request.at));
-  const idleGapMs = firstCompaction.created - lastKeepAliveAt;
-  assert(idleGapMs >= IDLE_SECONDS * 1000 - 150, `Compaction fired before the final keep-alive plus the idle window: ${idleGapMs}ms`);
-  assert(idleGapMs < CACHE_TTL_SECONDS * 1000, `Compaction fired at/after cache TTL: ${idleGapMs}ms after the final keep-alive`);
-  assert(firstCompaction.created > settled.created, "Compaction must follow the settled run");
+  // A user compacts by hand right after a run: that is this stretch's compaction, so the plugin must not add another.
+  const manual = await newSession(directory);
+  await runOnce(host, manual.id, "manual compaction case [tag:manual]");
+  await host.session.compact({ sessionID: manual.id });
+  await waitFor("the manual compaction", () => idleCompactions(manual.id).at(0), 10_000);
+
+  /** First compaction of a session must come a full idle window after the last keep-alive that session received. */
+  const expectCompactionAfterWarming = async (label: string, tag: string, sessionID: string, settledAt: number) => {
+    const compaction = await waitFor(`${label}: automatic idle compaction`, () => idleCompactions(sessionID).at(0), (CACHE_TTL_SECONDS + 8) * 1000);
+    const keepAlives = providerRequests.filter(request => request.keepAlive && request.tag === tag && request.at <= compaction.created);
+    assert(keepAlives.length >= 2, `${label}: warming must have run before the compaction, or the test proves nothing about it`);
+    const gapMs = compaction.created - Math.max(...keepAlives.map(request => request.at));
+    assert(gapMs >= IDLE_SECONDS * 1000 - 150, `${label}: compaction fired before the final keep-alive plus the idle window: ${gapMs}ms`);
+    assert(gapMs < CACHE_TTL_SECONDS * 1000, `${label}: compaction fired at/after cache TTL: ${gapMs}ms after the final keep-alive`);
+    assert(compaction.created > settledAt, `${label}: compaction must follow the settled run`);
+    return { keepAlives: keepAlives.length, gapMs };
+  };
+  const main = await expectCompactionAfterWarming("main location", "main", session.id, settled.created);
+  const second = await expectCompactionAfterWarming("other location", "other", other.id, otherSettled.created);
 
   await Bun.sleep((CACHE_TTL_SECONDS + 1) * 1000);
   assert.equal(idleCompactions(session.id).length, 1, "Exactly one automatic compaction per idle stretch");
-  assert.equal(idleCompactions(oldSession.id).length, 0, "The old chat stays untouched after the new chat compacts");
+  assert.equal(idleCompactions(other.id).length, 1, "A second location's instance must not add a duplicate compaction");
+  assert.equal(idleCompactions(oldSession.id).length, 0, "The old chat stays untouched after the new chats compact");
+  assert.equal(idleCompactions(manual.id).length, 1, "A manual compaction cancels the countdown, so the plugin adds none");
+  assert.equal(announcedFor(manual.id), 0, "The plugin must not decide to compact a session the user just compacted");
+  assert.equal(announcedFor(other.id), 1, "The other location is compacted by exactly one plugin instance");
+  assert.equal(announcedFor(oldSession.id), 0, "The old chat is never a candidate");
 
   const secondRunStarted = providerRequests.length;
-  await runOnce(host, session.id, "second prompt after idle compaction");
+  await runOnce(host, session.id, "second prompt after idle compaction [tag:main]");
   assert(providerRequests.length > secondRunStarted, "The user prompt must reach the provider");
   await waitFor("second automatic idle compaction after a new prompt", () => (idleCompactions(session.id).length >= 2 ? true : undefined), (CACHE_TTL_SECONDS + 5) * 1000);
   await Bun.sleep((CACHE_TTL_SECONDS + 1) * 1000);
   assert.equal(idleCompactions(session.id).length, 2, "A new user prompt starts exactly one new idle stretch");
+  assert.equal(idleCompactions(other.id).length, 1, "The untouched second location stays at one compaction");
 
   console.log(JSON.stringify({
     nativeEnforcement: "verified",
     idleSeconds: IDLE_SECONDS,
     cacheTtlSeconds: CACHE_TTL_SECONDS,
     oldChatCompactions: idleCompactions(oldSession.id).length,
-    keepAlivesBeforeCompaction: keepAlivesBeforeCompaction.length,
-    idleGapFromFinalKeepAliveMs: idleGapMs,
-    automaticCompactions: idleCompactions(session.id).length,
+    keepAlivesBeforeCompaction: { main: main.keepAlives, other: second.keepAlives },
+    idleGapFromFinalKeepAliveMs: { main: main.gapMs, other: second.gapMs },
+    automaticCompactions: { main: idleCompactions(session.id).length, other: idleCompactions(other.id).length },
     compactionReasons: idleCompactions(session.id).map(event => event.data?.reason),
   }));
 } catch (error) {
