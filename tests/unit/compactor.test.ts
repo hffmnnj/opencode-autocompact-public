@@ -13,6 +13,7 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
   const scheduled: ScheduledRun[] = [];
   const compacted: string[] = [];
   const reports: string[] = [];
+  const announced: Array<{ sessionID: string; idleMs: number }> = [];
 
   const deps: CompactorDeps = {
     now: () => clock,
@@ -29,6 +30,9 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
     },
     report: message => {
       reports.push(message);
+    },
+    announce: (sessionID, idleMs) => {
+      announced.push({ sessionID, idleMs });
     },
     ...overrides,
   };
@@ -56,6 +60,7 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
     compactor,
     compacted,
     reports,
+    announced,
     advanceTo: async (ms: number) => {
       await runDueTimers(ms);
       clock = ms;
@@ -74,7 +79,7 @@ function harness(overrides: Partial<CompactorDeps> = {}) {
 describe("idle compaction timing", () => {
   test("compacts exactly at the 290 second idle window after a settled run", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.advanceTo(290 * SECOND - 1);
@@ -86,12 +91,12 @@ describe("idle compaction timing", () => {
 
   test("never compacts while an execution is running, however long it runs", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
 
     await h.advanceTo(1000 * SECOND);
     expect(h.compacted).toEqual([]);
 
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(1000 * SECOND + 290 * SECOND);
     expect(h.compacted).toEqual([SESSION]);
@@ -99,7 +104,7 @@ describe("idle compaction timing", () => {
 
   test("a user prompt during the idle window cancels the pending compaction", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.advanceTo(100 * SECOND);
@@ -111,13 +116,13 @@ describe("idle compaction timing", () => {
 
   test("the idle window restarts from the next settled run, not from the earlier prompt", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(100 * SECOND);
     h.compactor.userPrompted(SESSION);
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     await h.advanceTo(200 * SECOND);
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.advanceTo(200 * SECOND + 289 * SECOND);
@@ -131,14 +136,14 @@ describe("idle compaction timing", () => {
 describe("idle stretch guarantees", () => {
   test("compacts at most once per idle stretch, even though its own run settles again", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(290 * SECOND);
     expect(h.compacted).toEqual([SESSION]);
 
     // The automatic compaction is itself an execution; its settlement must not start a second countdown.
-    h.compactor.executionStarted(SESSION);
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(290 * SECOND + 10_000 * SECOND);
     expect(h.compacted).toEqual([SESSION]);
@@ -146,13 +151,13 @@ describe("idle stretch guarantees", () => {
 
   test("a new user prompt starts a fresh stretch that can compact again", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(290 * SECOND);
 
     h.compactor.userPrompted(SESSION);
-    h.compactor.executionStarted(SESSION);
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     const settledAt = h.now();
     await h.advanceTo(settledAt + 290 * SECOND);
@@ -165,7 +170,7 @@ describe("idle stretch guarantees", () => {
         throw new Error("provider transcript: secret user text");
       },
     });
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(290 * SECOND);
     await h.advanceTo(2000 * SECOND);
@@ -178,7 +183,7 @@ describe("idle stretch guarantees", () => {
 describe("cache-expiry safety", () => {
   test("does not compact cold when the timer wakes after the cache TTL has already passed", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     // Suspended machine: the timer is overdue and the cache has expired by the time it runs.
@@ -188,7 +193,7 @@ describe("cache-expiry safety", () => {
 
   test("still compacts when the timer fires late but inside the warm window", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.wakeAt(295 * SECOND);
@@ -199,7 +204,7 @@ describe("cache-expiry safety", () => {
 describe("eligibility and lifecycle", () => {
   test("does not compact sessions the policy excludes, such as subagents", async () => {
     const h = harness({ isEligible: async () => false });
-    h.compactor.executionStarted("ses_child");
+    h.compactor.modelCalled("ses_child");
     h.compactor.executionSettled("ses_child");
 
     await h.advanceTo(290 * SECOND);
@@ -212,7 +217,7 @@ describe("eligibility and lifecycle", () => {
       releaseLookup = resolve;
     });
     const h = harness({ isEligible: () => pendingLookup });
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.advanceTo(290 * SECOND);
@@ -226,7 +231,7 @@ describe("eligibility and lifecycle", () => {
 
   test("dispose cancels every pending compaction", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     h.compactor.dispose();
@@ -236,7 +241,7 @@ describe("eligibility and lifecycle", () => {
 
   test("forgetting a deleted session cancels its pending compaction", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     h.compactor.forget(SESSION);
@@ -248,7 +253,7 @@ describe("eligibility and lifecycle", () => {
 describe("warming keep-alives", () => {
   test("compacts 290 seconds after the final keep-alive, not after the settled run", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.advanceTo(240 * SECOND);
@@ -265,14 +270,14 @@ describe("warming keep-alives", () => {
 
   test("a keep-alive while the session is running neither starts nor restarts a countdown", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     await h.advanceTo(100 * SECOND);
     h.compactor.warmingPinged(SESSION);
 
     await h.advanceTo(10_000 * SECOND);
     expect(h.compacted).toEqual([]);
 
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(10_000 * SECOND + 290 * SECOND);
     expect(h.compacted).toEqual([SESSION]);
@@ -280,7 +285,7 @@ describe("warming keep-alives", () => {
 
   test("a keep-alive after the automatic compaction does not start another countdown", async () => {
     const h = harness();
-    h.compactor.executionStarted(SESSION);
+    h.compactor.modelCalled(SESSION);
     h.compactor.executionSettled(SESSION);
     await h.advanceTo(290 * SECOND);
     expect(h.compacted).toEqual([SESSION]);
@@ -300,7 +305,7 @@ describe("warming keep-alives", () => {
 });
 
 describe("only sessions active under observation", () => {
-  test("a run that settles without an observed start (began before load) is never compacted", async () => {
+  test("a run that settles for a session this instance never owned is never compacted", async () => {
     const h = harness();
     h.compactor.executionSettled(SESSION);
 
@@ -318,12 +323,68 @@ describe("only sessions active under observation", () => {
     expect(h.compacted).toEqual([]);
   });
 
-  test("a user prompt counts as observed activity, so the session becomes eligible once it settles", async () => {
+  test("a user prompt makes the session owned, so it becomes eligible once it settles", async () => {
     const h = harness();
     h.compactor.userPrompted(SESSION);
     h.compactor.executionSettled(SESSION);
 
     await h.advanceTo(290 * SECOND);
     expect(h.compacted).toEqual([SESSION]);
+  });
+});
+
+describe("sessions owned by another plugin instance", () => {
+  // Events reach every instance; hooks reach only the owner. A non-owner must stay inert even though it hears
+  // every start and settle, because it will never hear the keep-alives that postpone compaction.
+  test("start and settle events alone never arm a countdown", async () => {
+    const h = harness();
+    h.compactor.executionStarted(SESSION);
+    h.compactor.executionSettled(SESSION);
+
+    await h.advanceTo(10_000 * SECOND);
+    expect(h.compacted).toEqual([]);
+    expect(h.announced).toEqual([]);
+  });
+
+});
+
+describe("compactions requested by someone else", () => {
+  test("a manual compaction during the countdown cancels the automatic one", async () => {
+    const h = harness();
+    h.compactor.modelCalled(SESSION);
+    h.compactor.executionSettled(SESSION);
+    await h.advanceTo(100 * SECOND);
+    h.compactor.compactionRequested(SESSION);
+
+    await h.advanceTo(10_000 * SECOND);
+    expect(h.compacted).toEqual([]);
+  });
+
+  test("a later keep-alive does not revive the countdown after a manual compaction", async () => {
+    const h = harness();
+    h.compactor.modelCalled(SESSION);
+    h.compactor.executionSettled(SESSION);
+    h.compactor.compactionRequested(SESSION);
+    h.compactor.warmingPinged(SESSION);
+
+    await h.advanceTo(10_000 * SECOND);
+    expect(h.compacted).toEqual([]);
+  });
+
+});
+
+describe("accountability", () => {
+  test("every automatic compaction is announced with the idle time, and a skipped one is not", async () => {
+    const h = harness();
+    h.compactor.modelCalled(SESSION);
+    h.compactor.executionSettled(SESSION);
+    await h.advanceTo(290 * SECOND);
+    expect(h.announced).toEqual([{ sessionID: SESSION, idleMs: 290 * SECOND }]);
+
+    const skipped = harness({ isEligible: async () => false });
+    skipped.compactor.modelCalled(SESSION);
+    skipped.compactor.executionSettled(SESSION);
+    await skipped.advanceTo(290 * SECOND);
+    expect(skipped.announced).toEqual([]);
   });
 });

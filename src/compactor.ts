@@ -10,10 +10,23 @@ export interface CompactorDeps {
   readonly schedule: (run: () => void, delayMs: number) => () => void;
   readonly isEligible: (sessionID: string) => Promise<boolean>;
   readonly compact: (sessionID: string) => Promise<void>;
+  /** Failures only; never include conversation content. */
   readonly report: (message: string) => void;
+  /** Every automatic compaction is announced, so an unexpected one can be traced to this plugin. */
+  readonly announce: (sessionID: string, idleMs: number) => void;
 }
 
+/**
+ * Session events are delivered to every plugin instance, but hooks only reach the instance whose location owns the
+ * session. A keep-alive is therefore visible only to the owner. State is created solely from owner-scoped signals
+ * (`userPrompted`, `modelCalled`); every event-driven method ignores sessions it has no state for. Without that rule,
+ * each other instance counts down on its own, never hears a keep-alive, and compacts a still-warming session.
+ */
 export interface IdleCompactor {
+  /** A model call seen through a hook, so this instance owns the session and it is running now. */
+  modelCalled(sessionID: string): void;
+  /** A compaction request by anyone (manual or automatic): this stretch has had its compaction. */
+  compactionRequested(sessionID: string): void;
   executionStarted(sessionID: string): void;
   executionSettled(sessionID: string): void;
   /** A keep-alive ping: the countdown restarts from here, so compaction waits until warming stops. */
@@ -25,8 +38,6 @@ export interface IdleCompactor {
 
 /** One idle stretch: from a settled run until the next user prompt or execution. */
 interface Stretch {
-  /** Set only by activity this plugin watched happen. Sessions idle before load stay untouched until they run again. */
-  observed: boolean;
   busy: boolean;
   /** At most one automatic compaction per stretch, so our own compaction cannot re-arm the next one. */
   compacted: boolean;
@@ -42,7 +53,7 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
   const stretchFor = (sessionID: string): Stretch => {
     const existing = stretches.get(sessionID);
     if (existing) return existing;
-    const created: Stretch = { observed: false, busy: false, compacted: false, generation: 0 };
+    const created: Stretch = { busy: false, compacted: false, generation: 0 };
     stretches.set(sessionID, created);
     return created;
   };
@@ -72,17 +83,18 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
       if (elapsed >= options.cacheTtlMs) return;
 
       stretch.compacted = true;
-      void compactIdle(sessionID, generation, stretch);
+      void compactIdle(sessionID, generation, stretch, elapsed);
     };
 
     stretch.cancel = deps.schedule(tick, options.idleMs);
   };
 
-  const compactIdle = async (sessionID: string, generation: number, stretch: Stretch): Promise<void> => {
+  const compactIdle = async (sessionID: string, generation: number, stretch: Stretch, idleMs: number): Promise<void> => {
     try {
       if (!(await deps.isEligible(sessionID))) return;
       // Re-check after the awaited lookup: a prompt or new execution may have arrived in the meantime.
       if (disposed || stretch.generation !== generation || stretch.busy) return;
+      deps.announce(sessionID, idleMs);
       await deps.compact(sessionID);
     } catch {
       // Never forward the native error: it can contain conversation content.
@@ -90,26 +102,40 @@ export function createIdleCompactor(options: CompactorOptions, deps: CompactorDe
     }
   };
 
+  /** Event-driven methods only touch sessions that an owner-scoped signal already registered. */
+  const known = (sessionID: string): Stretch | undefined => stretches.get(sessionID);
+
   return {
-    executionStarted(sessionID) {
+    modelCalled(sessionID) {
       const stretch = stretchFor(sessionID);
-      stretch.observed = true;
+      stretch.busy = true;
+      disarm(stretch);
+    },
+    compactionRequested(sessionID) {
+      const stretch = known(sessionID);
+      if (!stretch) return;
+      stretch.compacted = true;
+      disarm(stretch);
+    },
+    executionStarted(sessionID) {
+      const stretch = known(sessionID);
+      if (!stretch) return;
       stretch.busy = true;
       disarm(stretch);
     },
     executionSettled(sessionID) {
-      const stretch = stretchFor(sessionID);
+      const stretch = known(sessionID);
+      if (!stretch) return;
       stretch.busy = false;
-      if (stretch.observed && !stretch.compacted && !disposed) arm(sessionID, stretch);
+      if (!stretch.compacted && !disposed) arm(sessionID, stretch);
     },
     warmingPinged(sessionID) {
-      const stretch = stretchFor(sessionID);
-      if (!stretch.observed || stretch.busy || stretch.compacted || disposed) return;
+      const stretch = known(sessionID);
+      if (!stretch || stretch.busy || stretch.compacted || disposed) return;
       arm(sessionID, stretch);
     },
     userPrompted(sessionID) {
       const stretch = stretchFor(sessionID);
-      stretch.observed = true;
       stretch.compacted = false;
       disarm(stretch);
     },

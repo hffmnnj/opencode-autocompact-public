@@ -10,7 +10,10 @@ An OpenCode V2 plugin that compacts a primary session once it has been idle for 
 - Compaction is requested with `session.compact({ delivery: "queue" })`. An idle session runs it immediately, and a racing user message is queued rather than injected into a running turn.
 - **At most one automatic compaction per idle stretch.** The compaction run's own settlement does not start another countdown. A new user prompt starts a fresh stretch.
 - **Cache-expiry guard.** The compaction fires only while the elapsed idle time is below `cacheTtlSeconds`. If the process was suspended and the timer wakes late, the cache has expired, and a cold compaction would re-read the full history and then pay for the summary too. In that case nothing happens.
-- **Only sessions active under observation.** A session becomes eligible when this plugin sees it run (an execution starts) or receives a prompt after load. Sessions that were idle when the plugin loaded are never compacted, and keep-alives alone do not make them eligible. Old chats stay untouched until they run again.
+- **Only sessions this plugin instance owns and has seen active.** The host loads one plugin instance per location (project directory). Session *events* reach every instance, but *hooks* reach only the instance whose location holds the session, and keep-alives are visible only through a hook. So a session becomes eligible only through a hook in its own instance: a user prompt or a model call (`context`). Events alone never create state, because an instance that cannot hear the keep-alives would fire at the settled run plus 290 seconds while warming is still running. Sessions that were idle when the plugin loaded are never compacted, and keep-alives alone do not make them eligible. Old chats stay untouched until they run again.
+- **A compaction by anyone ends the stretch.** A manual `/compact` during the countdown cancels it, and no automatic one follows until the next user prompt.
+- **Location check at fire time.** Before compacting, the instance re-reads the session and refuses unless the session's directory is its own. This is a second layer in case hooks ever stop being location-scoped.
+- **Every automatic compaction is announced** in the server log as `opencode-autocompact: compacting <sessionID> after <N>s idle in <directory>`. The host records these as `reason: "manual"`, so this line is the only way to tell them apart.
 - **Primary sessions only** by default. Child sessions (subagents) are skipped unless `includeSubagents` is set.
 
 ## Install
@@ -46,15 +49,26 @@ Claude Code shipped idle compaction in 2.1.286. Per GitHub issue anthropics/clau
 
 - Compaction is lossy and is a model call. It runs whether or not you intended to come back.
 - Eligibility is in memory and resets on every host restart. A session becomes eligible again only after it runs or receives a prompt under the new host.
-- A run that began before the plugin loaded and settles afterwards is never compacted, because its start was not observed. This case is covered by unit tests only; the native check uses a chat that finished before the reload.
+- A run that began before the plugin loaded and settles afterwards is never compacted, because no hook of this instance saw it start. This case is covered by unit tests only; the native check uses a chat that finished before the reload.
+- A session run only by something that fires neither the `prompt` nor the `context` hook is never owned, so it is never compacted. That fails safe.
 - The native host records these compactions as `reason: "manual"`, because they go through the API.
 - The timer uses wall-clock time. A suspended machine that wakes inside the TTL window still compacts warm. A wake after the TTL is skipped.
 
+## Incident: compaction while warming (fixed)
+
+The first live version compacted a session at exactly the settled run plus 290 seconds, although native warming had pinged it 54 seconds earlier. Cause, reproduced with a probe on a real two-location host: the plugin loads once per location, events reach all instances, hooks reach only the owner. The other instances armed a countdown from the events, never heard a keep-alive, and fired. Fix: ownership comes only from hooks, as described above. The host test now runs two locations and fails on the old code with `compaction fired before the final keep-alive plus the idle window: 16ms`.
+
 ## Verification
 
-- `bun run check`: typecheck, then 24 deterministic unit tests on an injected clock. Boundary cases cover exactly 290s, the cache-TTL cutoff, a late wake, a prompt during the window, a pending eligibility lookup, and once-per-stretch behavior.
-- Four production faults were injected into copies, and each turned the matching unit test red: no TTL guard, no stale re-check, no once-per-stretch guard, and a prompt that did not cancel the timer.
-- Warming unit tests: keep-alive recognition, plus countdown restarts on keep-alives, ignored while running or after compaction. Mutants that ignore keep-alives or drop the running guard turn the matching tests red.
-- `bun run test:host`: an isolated real OpenCode V2 host (2.0.25), restarted across a plugin load. An old chat that finished before the plugin loaded gets no compaction and no keep-alives through a full idle window plus TTL. The loopback scripted provider and native warming are on (`interval 1s`, `duration 4s`). It loads the plugin by path with `idleSeconds: 2` and `cacheTtlSeconds: 6`, then measures from the last keep-alive the provider actually received. It checks one compaction per stretch and a fresh one after a new prompt. Copies with the prompt hook removed, or the keep-alive observer removed, fail the matching checks.
+- `bun run check`: typecheck, then the deterministic unit tests on an injected clock. They cover exactly 290s, the cache-TTL cutoff, a late wake, a prompt during the window, a pending eligibility lookup, once-per-stretch, keep-alive restarts, events for sessions the instance does not own, manual compactions, and the announcement.
+- `bun run test:host`: an isolated real OpenCode V2 host (2.0.25), restarted across a plugin load, with two locations, a loopback scripted provider and native warming on (`interval 1s`, `duration 4s`; plugin `idleSeconds: 2`, `cacheTtlSeconds: 6`). It checks:
+  - an old chat that finished before the plugin loaded gets no compaction, no keep-alive and no announcement;
+  - in each location, the compaction comes a full idle window after that session's own last keep-alive, once per stretch, with no duplicate from the other instance;
+  - a new prompt starts exactly one new stretch;
+  - a manual compaction right after a run leaves the plugin with no compaction decision at all (checked through the announcement, because a repeat compaction of a compacted session leaves no host event).
+- Fault injections, each in a scratch copy: the pre-fix code fails the two-location host test; removing the compaction hook fails the host test; letting events create state fails four unit tests; and the earlier ones (no TTL guard, no stale re-check, no once-per-stretch guard, prompt not cancelling, keep-alives ignored, running not guarded) fail their unit tests.
 
-Not verified: whether native warming treats the automatic compaction as activity and extends its keep-alives for another 30 minutes. Code reading suggests it does, since the warming `compaction` hook counts any non-keep-alive request. A live run with the default 290s/300s values (the boundary is covered by unit tests and the config defaults by `config.test.ts`), the subagent exclusion path under a real nested run, and whether the compaction request reuses the cached prefix on the provider side.
+Not verified:
+- The fire-time location check on its own. Hooks already keep other instances inert, so removing only the check passes every test. It is defence in depth, kept because the failure it guards against is silent.
+- Whether native warming treats the automatic compaction as activity and extends its keep-alives for another 30 minutes. Code reading suggests it does.
+- A live run with the default 290s/300s values, the subagent exclusion path under a real nested run, and whether the compaction request reuses the cached prefix on the provider side.
