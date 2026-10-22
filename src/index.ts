@@ -32,6 +32,8 @@ export default Plugin.define({
         },
         isEligible: async sessionID => {
           const info = await ctx.session.get({ sessionID });
+          // Official OpenAI models now retain their prompt cache without this idle compaction.
+          if (info.model?.providerID === "openai") return false;
           // Hooks are location-scoped today, so only the owning instance has state. This check keeps a second
           // instance from compacting someone else's session should that ever stop being true.
           if (info.location.directory !== ctx.location.directory) return false;
