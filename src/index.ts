@@ -6,7 +6,7 @@ import { failOpen } from "./safe";
 import { isWarmingPing } from "./warming";
 
 export default Plugin.define({
-  id: "opencode-autocompact",
+  id: "hffmnnj.autocompact",
   async setup(ctx) {
     const config = parseConfig(ctx.options);
     const warn = (message: string): void => console.warn(`opencode-autocompact: ${message}`);
