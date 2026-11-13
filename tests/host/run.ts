@@ -1,10 +1,12 @@
 import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Each run gets a fresh isolated HOME/XDG tree. Evidence directories are retained, never recursively deleted.
-const root = await mkdtemp("/tmp/autocompact-host-");
-const child = Bun.spawn([process.execPath, fileURLToPath(new URL("native.ts", import.meta.url)), root], {
+const temporary = tmpdir();
+const root = await mkdtemp(join(temporary, "autocompact-host-"));
+const child = Bun.spawn([process.execPath, fileURLToPath(new URL("native.ts", import.meta.url)), root, temporary], {
   cwd: root,
   env: {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
