@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import { OpenCode } from "@opencode/sdk";
 
 // Runs inside an isolated HOME/XDG tree created by run.ts. Real native host, real plugin loader, scripted provider.
 const root = process.argv[2]!;
-assert(root.startsWith("/tmp/autocompact-host-") && process.env.HOME === join(root, "home"));
+const temporary = process.argv[3]!;
+assert(root === resolve(root) && dirname(root) === resolve(temporary) && root.startsWith(join(temporary, "autocompact-host-")) && process.env.TMPDIR === root && process.env.HOME === join(root, "home"));
 // Two locations: the plugin loads one instance per location, and events reach every instance while hooks do not.
 const directory = join(root, "workspace");
 const otherDirectory = join(root, "workspace-other");
