@@ -33,7 +33,7 @@ Options are optional and can be passed alongside the package:
 
 ## Behavior
 
-- A run that settles (`session.execution.succeeded`, `failed`, or `interrupted`) starts an idle countdown. The default is **290 seconds**, just under the 5-minute prompt-cache lifetime, so the compaction request is dispatched while the cache is still warm.
+- A run that settles (`session.execution.succeeded`, `failed`, or `interrupted`) starts an idle countdown. The default is **290 seconds**, just under the configured five-minute cache window.
 - **Warming comes first.** The native `opencode.warming` plugin sends keep-alive requests while a session is idle. Each keep-alive restarts the countdown, so compaction fires **290 seconds after the final keep-alive**, once warming has stopped. Keep-alives are recognised by their prompt, which must match `warmingPrompt` (default: the native prompt). With warming disabled, the countdown runs from the settled run.
 - A new user prompt, model call, or execution cancels the pending countdown.
 - Compaction is requested with `session.compact({ delivery: "queue" })`. An idle session runs it immediately, and a racing user message is queued rather than injected into a running turn.
@@ -91,4 +91,4 @@ The plugin does not use `ctx.storage`; eligibility is held in memory, and the op
 - A session run only by something that fires neither the `prompt` nor the `context` hook is never owned, so it is never compacted. That fails safe.
 - A failed compaction request is logged and not retried until the next user prompt.
 - The native host records these compactions as `reason: "manual"`, because they go through the API.
-- The timer uses wall-clock time. A suspended machine that wakes inside the TTL window still compacts warm; a wake at or after the TTL is skipped.
+- The timer uses wall-clock time. A suspended machine that wakes inside the configured TTL window can still compact; a wake at or after the TTL is skipped.
