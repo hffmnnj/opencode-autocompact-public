@@ -212,7 +212,7 @@ try {
   const catalog = await host?.plugin.list({ location: { directory } }).catch(() => undefined);
   console.error(JSON.stringify({
     error: error instanceof Error ? error.message : "unknown failure",
-    plugins: catalog?.data.filter(plugin => plugin.id === "opencode-autocompact").map(plugin => ({ id: plugin.id, status: plugin.state.status })),
+    plugins: catalog?.data.filter(plugin => plugin.id === "hffmnnj.autocompact").map(plugin => ({ id: plugin.id, status: plugin.state.status })),
     eventTypes: [...new Set(observed.map(event => event.type))],
     compactionFailures: observed.filter(event => event.type === "session.compaction.failed"),
     providerRequests: providerRequests.length,
